@@ -1,0 +1,20 @@
+{
+  "type": "record",
+  "name": "SalesEvent",
+  "namespace": "com.portfolio.realtime",
+  "fields": [
+    {"name": "event_id", "type": "string"},
+    {"name": "event_time", "type": "string"},
+    {"name": "ingest_time", "type": "string"},
+    {"name": "account_id", "type": "string"},
+    {"name": "user_id", "type": ["null", "string"], "default": null},
+    {"name": "event_type", "type": "string"},
+    {"name": "plan_tier", "type": "string"},
+    {"name": "region", "type": "string"},
+    {"name": "currency", "type": "string"},
+    {"name": "amount", "type": "double"},
+    {"name": "source", "type": ["null", "string"], "default": null},
+    {"name": "trace_id", "type": ["null", "string"], "default": null},
+    {"name": "schema_version", "type": "int"}
+  ]
+}
