@@ -19,7 +19,7 @@ services:
       KAFKA_INTER_BROKER_LISTENER_NAME: "INTERNAL"
 
       # Dev-friendly defaults
-      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
       KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
       KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
@@ -58,6 +58,37 @@ services:
       - schema-registry
     networks:
       - realtime_net
+
+  kafka-init:
+    image: apache/kafka:3.7.0
+    container_name: kafka-init
+    depends_on:
+      - kafka
+    entrypoint: /bin/bash
+    command: -c "
+      echo 'Waiting for Kafka...';
+      sleep 10;
+
+      echo 'Creating topics (idempotent)...';
+
+      kafka-topics.sh --bootstrap-server kafka:29092 \
+        --create --if-not-exists \
+        --topic sales.events.v1 \
+        --partitions 3 \
+        --replication-factor 1;
+
+      kafka-topics.sh --bootstrap-server kafka:29092 \
+        --create --if-not-exists \
+        --topic sales.events.dlq.v1 \
+        --partitions 3 \
+        --replication-factor 1;
+
+      echo 'Listing topics:';
+      kafka-topics.sh --bootstrap-server kafka:29092 --list;"
+
+    networks:
+      - realtime_net
+    restart: "no"
 
 volumes:
   kafka_data:
