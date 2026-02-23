@@ -29,20 +29,16 @@ services:
       - kafka_data:/var/lib/kafka/data
     networks:
       - realtime_net
-
+  
   schema-registry:
-    image: ghcr.io/aiven/karapace:latest
+    image: confluentinc/cp-schema-registry:7.5.0
     container_name: schema-registry
     ports:
-      - "8081:8081"   # Schema Registry API (Confluent-compatible)
-      - "8082:8082"   # Karapace REST proxy (optional)
+      - "8081:8081"
     environment:
-      KARAPACE_BOOTSTRAP_URI: "kafka:29092"
-      KARAPACE_HOST: "0.0.0.0"
-      KARAPACE_PORT: "8081"
-      KARAPACE_REST_HOST: "0.0.0.0"
-      KARAPACE_REST_PORT: "8082"
-      KARAPACE_LOG_LEVEL: "INFO"
+      SCHEMA_REGISTRY_HOST_NAME: schema-registry
+      SCHEMA_REGISTRY_KAFKASTORE_BOOTSTRAP_SERVERS: PLAINTEXT://kafka:29092
+      SCHEMA_REGISTRY_LISTENERS: http://0.0.0.0:8081
     depends_on:
       - kafka
     networks:
