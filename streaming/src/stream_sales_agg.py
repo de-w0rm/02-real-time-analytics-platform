@@ -6,15 +6,10 @@ from typing import Dict, Any
 import requests
 from fastavro import schemaless_reader
 
-from pyspark.sql import SparkSession
-from pyspark.sql.functions import (
-    col, from_json, to_timestamp, window, sum as fsum, expr
-)
-from pyspark.sql.types import (
-    StructType, StructField, StringType, DoubleType, IntegerType
-)
-from pyspark.sql.functions import udf
-from pyspark.sql.functions import lit
+from pyspark.sql import SparkSession, DataFrame
+from pyspark.sql import functions as F
+from pyspark.sql.functions import col, from_json, to_timestamp, window, sum as fsum, expr, udf
+from pyspark.sql.types import StructType, StructField, StringType, DoubleType, IntegerType
 
 
 KAFKA_BOOTSTRAP = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "kafka:29092")
@@ -29,6 +24,7 @@ TRIGGER_INTERVAL = os.getenv("TRIGGER_INTERVAL", "10 seconds")
 
 DQ_DIR = os.getenv("DQ_DIR", "/data/dq/revenue_5m")
 LATENCY_SLA_SECONDS = int(os.getenv("LATENCY_SLA_SECONDS", "300"))  # 5 minutes
+
 
 # Cache schemas by id to avoid hitting Schema Registry every row
 _schema_cache: Dict[int, Dict[str, Any]] = {}
@@ -89,64 +85,119 @@ EVENT_SCHEMA = StructType([
     StructField("schema_version", IntegerType(), False),
 ])
 
-def write_dq_metrics(batch_df, batch_id: int):
+
+def write_dq_metrics(batch_df: DataFrame, batch_id: int) -> None:
     """
     Lightweight DQ metrics per micro-batch.
-    Writes JSON metrics to DQ_DIR.
+
+    Goals:
+      - Single-pass aggregation (avoid multiple count() actions)
+      - Idempotent output per batch_id (safe on retries/restarts)
+      - Optional capped sample of violating rows for debugging
+
+    Output layout under DQ_DIR (default: /data/dq/revenue_5m):
+      - {DQ_DIR}/metrics/batch_id=<id>/
+      - {DQ_DIR}/samples/batch_id=<id>/
     """
     if batch_df.rdd.isEmpty():
         return
 
     required_cols = ["event_id", "event_ts", "amount", "region", "plan_tier", "currency", "ingest_ts"]
 
-    total = batch_df.count()
-
-    # Null checks
-    null_any_required = None
-    for c in required_cols:
-        cond = col(c).isNull()
-        null_any_required = cond if null_any_required is None else (null_any_required | cond)
-
-    null_required_count = batch_df.filter(null_any_required).count()
-
-    # Domain checks
     valid_plan = ["free", "pro", "enterprise"]
     valid_region = ["NA", "EU", "LATAM", "APAC"]
     valid_currency = ["USD", "CAD", "EUR"]
 
-    invalid_domain_count = batch_df.filter(
-        (~col("plan_tier").isin(valid_plan))
-        | (~col("region").isin(valid_region))
-        | (~col("currency").isin(valid_currency))
-    ).count()
+    # Rule flags (pure column expressions)
+    null_required_flag = F.lit(False)
+    for c in required_cols:
+        null_required_flag = null_required_flag | F.col(c).isNull()
 
-    # Amount checks
-    bad_amount_count = batch_df.filter(
-        col("amount").isNull() | (col("amount") == 0) | expr("isnan(amount)")
-    ).count()
+    invalid_domain_flag = (
+        (~F.col("plan_tier").isin(valid_plan))
+        | (~F.col("region").isin(valid_region))
+        | (~F.col("currency").isin(valid_currency))
+    )
 
-    # Latency SLA (ingest_ts - event_ts)
-    latency_breach_count = batch_df.filter(
-        (col("ingest_ts").cast("long") - col("event_ts").cast("long")) > lit(LATENCY_SLA_SECONDS)
-    ).count()
+    bad_amount_flag = (
+        F.col("amount").isNull()
+        | (F.col("amount") == F.lit(0))
+        | F.isnan("amount")
+    )
 
-    valid = total - (null_required_count + invalid_domain_count + bad_amount_count)
+    latency_breach_flag = (
+        (F.col("ingest_ts").cast("long") - F.col("event_ts").cast("long"))
+        > F.lit(LATENCY_SLA_SECONDS)
+    )
 
-    metrics = [{
-        "batch_id": int(batch_id),
-        "total_records": int(total),
-        "valid_records_estimate": int(max(valid, 0)),
-        "null_required_fields": int(null_required_count),
-        "invalid_domain_values": int(invalid_domain_count),
-        "bad_amounts": int(bad_amount_count),
-        "latency_sla_breaches": int(latency_breach_count),
-    }]
+    # IMPORTANT: compute "invalid_any" as a single boolean to avoid double-count subtraction
+    invalid_any_flag = null_required_flag | invalid_domain_flag | bad_amount_flag
 
-    spark = batch_df.sparkSession
-    metrics_df = spark.createDataFrame(metrics)
-    metrics_df.write.mode("append").json(DQ_DIR)
+    # Single-pass aggregation
+    metrics_row = (
+        batch_df.select(
+            null_required_flag.alias("f_null_required"),
+            invalid_domain_flag.alias("f_invalid_domain"),
+            bad_amount_flag.alias("f_bad_amount"),
+            latency_breach_flag.alias("f_latency_breach"),
+            invalid_any_flag.alias("f_invalid_any"),
+        )
+        .agg(
+            F.count(F.lit(1)).alias("total_records"),
+            F.sum(F.col("f_null_required").cast("int")).alias("null_required_fields"),
+            F.sum(F.col("f_invalid_domain").cast("int")).alias("invalid_domain_values"),
+            F.sum(F.col("f_bad_amount").cast("int")).alias("bad_amounts"),
+            F.sum(F.col("f_latency_breach").cast("int")).alias("latency_sla_breaches"),
+            F.sum(F.col("f_invalid_any").cast("int")).alias("invalid_any"),
+        )
+        .withColumn("batch_id", F.lit(int(batch_id)))
+        .withColumn("dq_run_ts", F.current_timestamp())
+        .withColumn("valid_records_estimate", F.expr("greatest(total_records - invalid_any, 0)"))
+        .select(
+            "dq_run_ts",
+            "batch_id",
+            "total_records",
+            "valid_records_estimate",
+            "null_required_fields",
+            "invalid_domain_values",
+            "bad_amounts",
+            "latency_sla_breaches",
+        )
+    )
 
-def main():
+    # Idempotent write: deterministic per-batch path + overwrite
+    metrics_out = f"{DQ_DIR}/metrics/batch_id={int(batch_id)}"
+    (
+        metrics_row.coalesce(1)  # tiny output: keep it as one file
+        .write.mode("overwrite")
+        .json(metrics_out)
+    )
+
+    # Optional: sample violating rows (capped) for debugging
+    sample_limit = 100
+    samples_out = f"{DQ_DIR}/samples/batch_id={int(batch_id)}"
+
+    violations = (
+        batch_df.withColumn(
+            "dq_violation_reason",
+            F.concat_ws(
+                "|",
+                F.when(null_required_flag, F.lit("NULL_REQUIRED")),
+                F.when(invalid_domain_flag, F.lit("INVALID_DOMAIN")),
+                F.when(bad_amount_flag, F.lit("BAD_AMOUNT")),
+                F.when(latency_breach_flag, F.lit("LATENCY_SLA_BREACH")),
+            ),
+        )
+        .filter(null_required_flag | invalid_domain_flag | bad_amount_flag | latency_breach_flag)
+        .limit(sample_limit)
+    )
+
+    (
+        violations.write.mode("overwrite").json(samples_out)
+    )
+
+
+def main() -> None:
     spark = (
         SparkSession.builder
         .appName("sales-revenue-5m")
@@ -195,10 +246,11 @@ def main():
         .dropDuplicates(["event_id"])
     )
 
-    # Data quality metrics stream (writes per micro-batch JSON metrics)
+    # Data quality metrics stream
     dq_query = (
         deduped.writeStream
         .foreachBatch(write_dq_metrics)
+        .outputMode("append")  # foreachBatch ignores output mode, but keeping explicit is fine
         .option("checkpointLocation", os.path.join(CHECKPOINT_DIR, "_dq"))
         .trigger(processingTime=TRIGGER_INTERVAL)
         .start()
@@ -236,7 +288,8 @@ def main():
         .start()
     )
 
-    query.awaitTermination()
+    # Wait for either query to terminate (and keep process alive)
+    spark.streams.awaitAnyTermination()
 
 
 if __name__ == "__main__":
