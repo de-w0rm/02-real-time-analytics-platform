@@ -161,6 +161,8 @@ services:
       GOLD_DIR: /data/gold/revenue_5m
       WATERMARK_DELAY: "10 minutes"
       TRIGGER_INTERVAL: "10 seconds"
+      DQ_DIR: /data/dq/revenue_5m
+      LATENCY_SLA_SECONDS: "300"
     volumes:
       - ./data:/data
     command: >

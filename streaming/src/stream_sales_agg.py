@@ -14,6 +14,7 @@ from pyspark.sql.types import (
     StructType, StructField, StringType, DoubleType, IntegerType
 )
 from pyspark.sql.functions import udf
+from pyspark.sql.functions import lit
 
 
 KAFKA_BOOTSTRAP = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "kafka:29092")
@@ -25,6 +26,9 @@ GOLD_DIR = os.getenv("GOLD_DIR", "/data/gold/revenue_5m")
 
 WATERMARK_DELAY = os.getenv("WATERMARK_DELAY", "10 minutes")  # must cover your late-event simulation
 TRIGGER_INTERVAL = os.getenv("TRIGGER_INTERVAL", "10 seconds")
+
+DQ_DIR = os.getenv("DQ_DIR", "/data/dq/revenue_5m")
+LATENCY_SLA_SECONDS = int(os.getenv("LATENCY_SLA_SECONDS", "300"))  # 5 minutes
 
 # Cache schemas by id to avoid hitting Schema Registry every row
 _schema_cache: Dict[int, Dict[str, Any]] = {}
@@ -85,6 +89,62 @@ EVENT_SCHEMA = StructType([
     StructField("schema_version", IntegerType(), False),
 ])
 
+def write_dq_metrics(batch_df, batch_id: int):
+    """
+    Lightweight DQ metrics per micro-batch.
+    Writes JSON metrics to DQ_DIR.
+    """
+    if batch_df.rdd.isEmpty():
+        return
+
+    required_cols = ["event_id", "event_ts", "amount", "region", "plan_tier", "currency", "ingest_ts"]
+
+    total = batch_df.count()
+
+    # Null checks
+    null_any_required = None
+    for c in required_cols:
+        cond = col(c).isNull()
+        null_any_required = cond if null_any_required is None else (null_any_required | cond)
+
+    null_required_count = batch_df.filter(null_any_required).count()
+
+    # Domain checks
+    valid_plan = ["free", "pro", "enterprise"]
+    valid_region = ["NA", "EU", "LATAM", "APAC"]
+    valid_currency = ["USD", "CAD", "EUR"]
+
+    invalid_domain_count = batch_df.filter(
+        (~col("plan_tier").isin(valid_plan))
+        | (~col("region").isin(valid_region))
+        | (~col("currency").isin(valid_currency))
+    ).count()
+
+    # Amount checks
+    bad_amount_count = batch_df.filter(
+        col("amount").isNull() | (col("amount") == 0) | expr("isnan(amount)")
+    ).count()
+
+    # Latency SLA (ingest_ts - event_ts)
+    latency_breach_count = batch_df.filter(
+        (col("ingest_ts").cast("long") - col("event_ts").cast("long")) > lit(LATENCY_SLA_SECONDS)
+    ).count()
+
+    valid = total - (null_required_count + invalid_domain_count + bad_amount_count)
+
+    metrics = [{
+        "batch_id": int(batch_id),
+        "total_records": int(total),
+        "valid_records_estimate": int(max(valid, 0)),
+        "null_required_fields": int(null_required_count),
+        "invalid_domain_values": int(invalid_domain_count),
+        "bad_amounts": int(bad_amount_count),
+        "latency_sla_breaches": int(latency_breach_count),
+    }]
+
+    spark = batch_df.sparkSession
+    metrics_df = spark.createDataFrame(metrics)
+    metrics_df.write.mode("append").json(DQ_DIR)
 
 def main():
     spark = (
@@ -135,6 +195,15 @@ def main():
         .dropDuplicates(["event_id"])
     )
 
+    # Data quality metrics stream (writes per micro-batch JSON metrics)
+    dq_query = (
+        deduped.writeStream
+        .foreachBatch(write_dq_metrics)
+        .option("checkpointLocation", os.path.join(CHECKPOINT_DIR, "_dq"))
+        .trigger(processingTime=TRIGGER_INTERVAL)
+        .start()
+    )
+
     # 5-minute revenue windows (event-time)
     agg = (
         deduped
@@ -157,7 +226,7 @@ def main():
         )
     )
 
-    query = (
+    agg_query = (
         agg.writeStream
         .format("parquet")
         .outputMode("append")
