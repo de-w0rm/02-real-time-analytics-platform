@@ -164,14 +164,7 @@ services:
     volumes:
       - ./data:/data
     command: >
-      bash -lc "
-      sleep 15 &&
-      /opt/spark/bin/spark-submit
-        --master spark://spark-master:7077
-        --deploy-mode client
-        --packages org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.3
-        /app/src/stream_sales_agg.py
-      "
+      bash -lc "sleep 15 && /opt/spark/bin/spark-submit --master spark://spark-master:7077 --deploy-mode client --packages org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.3 /app/src/stream_sales_agg.py"
     networks:
       - realtime_net
     restart: unless-stopped
