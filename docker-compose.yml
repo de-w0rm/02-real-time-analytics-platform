@@ -119,6 +119,63 @@ services:
       - realtime_net
     restart: unless-stopped
 
+  spark-master:
+    build:
+      context: ./streaming
+    container_name: spark-master
+    command: bash -lc "/opt/spark/sbin/start-master.sh && tail -f /opt/spark/logs/*"
+    ports:
+      - "8088:8080"   # Spark Master UI (avoid clashing with Kafka UI)
+      - "7077:7077"   # Spark master port
+    networks:
+      - realtime_net
+
+  spark-worker-1:
+    build:
+      context: ./streaming
+    container_name: spark-worker-1
+    depends_on:
+      - spark-master
+    command: bash -lc "/opt/spark/sbin/start-worker.sh spark://spark-master:7077 && tail -f /opt/spark/logs/*"
+    environment:
+      SPARK_WORKER_CORES: "2"
+      SPARK_WORKER_MEMORY: "2g"
+    networks:
+      - realtime_net
+
+  spark-job:
+    build:
+      context: ./streaming
+    container_name: spark-job
+    depends_on:
+      - kafka
+      - schema-registry
+      - spark-master
+      - spark-worker-1
+      - producer
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      SCHEMA_REGISTRY_URL: http://schema-registry:8081
+      KAFKA_TOPIC: sales.events.v1
+      CHECKPOINT_DIR: /data/checkpoints/revenue_5m
+      GOLD_DIR: /data/gold/revenue_5m
+      WATERMARK_DELAY: "10 minutes"
+      TRIGGER_INTERVAL: "10 seconds"
+    volumes:
+      - ./data:/data
+    command: >
+      bash -lc "
+      sleep 15 &&
+      /opt/spark/bin/spark-submit
+        --master spark://spark-master:7077
+        --deploy-mode client
+        --packages org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.3
+        /app/src/stream_sales_agg.py
+      "
+    networks:
+      - realtime_net
+    restart: unless-stopped
+
 volumes:
   kafka_data:
 
